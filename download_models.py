@@ -113,7 +113,8 @@ def main():
     else:
         print(f"\n⚠ DiffV2IR checkpoint not found at: {diffv2ir_path}")
         print("  Please download it manually from:")
-        print("  - 夸克网盘: https://pan.quark.cn/s/e2f28304ee90 (访问码: EWCz)")
+        # original text:"  - 夸克网盘: https://pan.quark.cn/s/e2f28304ee90 (访问码: EWCz)"
+        print("  - Quark NetDisk: https://pan.quark.cn/s/e2f28304ee90 (access code: EWCz)")
         print("  - HuggingFace: https://huggingface.co/datasets/Lidong26/IR-500K/tree/main")
 
 if __name__ == "__main__":

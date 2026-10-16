@@ -714,6 +714,7 @@ class LatentDiffusion(DDPM):
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
                   cond_key=None, return_original_cond=False, bs=None, uncond=0.02):
         # x是目标图片
+        # x is the target image
         x = super().get_input(batch, k)
         
         if bs is not None:
