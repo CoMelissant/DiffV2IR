@@ -130,7 +130,7 @@ def evaluate_dataset(pred_dir, gt_dir, output_file=None, resize_method='resize')
 
     # 获取所有预测图像文件
     # Get all prediction image files
-    pred_files = sorted([f for f in os.listdir(pred_dir) if f.lower().endswith(('.png', '.jpg')))])
+    pred_files = sorted([f for f in os.listdir(pred_dir) if f.lower().endswith(('.png', '.jpg'))])
 
     # original text:"找到 {len(pred_files)} 张预测图像"
     print(f"Found {len(pred_files)} prediction images")
