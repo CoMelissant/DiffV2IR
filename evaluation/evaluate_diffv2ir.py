@@ -118,13 +118,137 @@ def compute_metrics(pred_path, gt_path, resize_method='resize'):
     
     return psnr_value, ssim_value, pred_size, gt_original_size, gt_mode
 
-def evaluate_dataset(pred_dir, gt_dir, output_file=None, resize_method='resize'):
+
+# ---------------------------------------------------------------------------
+# Optional perceptual / distributional metrics: LPIPS (per-image) and FID (set-level).
+# Both are opt-in. torch/torchvision/lpips are imported lazily so the PSNR/SSIM-only
+# path keeps working without them.
+# ---------------------------------------------------------------------------
+_LPIPS_CACHE = {}
+_INCEPTION_CACHE = None
+
+
+def _get_lpips(net='alex'):
+    """Lazily build (and cache) an LPIPS model. Returns None if lpips is unavailable."""
+    if net in _LPIPS_CACHE:
+        return _LPIPS_CACHE[net]
+    try:
+        import torch
+        import lpips
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] LPIPS unavailable ({e}); skipping LPIPS. Install with: pip install lpips")
+        return None
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    fn = lpips.LPIPS(net=net).to(device).eval()
+    _LPIPS_CACHE[net] = fn
+    print(f"LPIPS loaded (net={net}, device={device})")
+    return fn
+
+
+def _rgb01(array):
+    """Convert an aligned uint8 array (H,W) or (H,W,3) to a float [0,1] (3,H,W) array."""
+    arr = np.asarray(array)
+    if arr.ndim == 2:
+        arr = np.stack([arr] * 3, axis=-1)
+    return arr.astype(np.float32).transpose(2, 0, 1) / 255.0
+
+
+def compute_lpips(pred_array, gt_array, net='alex'):
+    """Per-image LPIPS (lower is better) for two aligned uint8 arrays of the same size."""
+    fn = _get_lpips(net)
+    if fn is None:
+        return None
+    import torch
+    p = torch.from_numpy(_rgb01(pred_array)).unsqueeze(0) * 2.0 - 1.0  # -> [-1,1] (1,3,H,W)
+    g = torch.from_numpy(_rgb01(gt_array)).unsqueeze(0) * 2.0 - 1.0
+    device = next(fn.parameters()).device
+    with torch.no_grad():
+        val = fn(p.to(device), g.to(device))
+    return float(val.item())
+
+
+def _get_inception(device=None):
+    """Lazily build (and cache) a feature-only InceptionV3 (2048-d pool output)."""
+    global _INCEPTION_CACHE
+    if _INCEPTION_CACHE is not None:
+        return _INCEPTION_CACHE
+    import torch
+    import torch.nn as nn
+    from torchvision.models import inception_v3
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = inception_v3(pretrained=True, transform_input=False)
+    model.fc = nn.Identity()  # keep the 2048-d pool features instead of the class logits
+    model.eval().to(device)
+    _INCEPTION_CACHE = (model, device)
+    print(f"InceptionV3 loaded for FID (device={device})")
+    return _INCEPTION_CACHE
+
+
+def inception_features(paths, target=(299, 299), batch=16, device=None):
+    """Inception 2048-d features for a list of image paths. Returns an (N, 2048) float32 array."""
+    model, device = _get_inception(device)
+    import torch
+    feats = []
+    for i in range(0, len(paths), batch):
+        chunk = paths[i:i + batch]
+        imgs = [np.asarray(Image.open(p).convert('RGB').resize(target, Image.BILINEAR), dtype=np.uint8)
+                for p in chunk]
+        t = torch.from_numpy(np.stack(imgs)).permute(0, 3, 1, 2).float() / 255.0  # (B,3,H,W) [0,1]
+        with torch.no_grad():
+            f = model(t.to(device))
+        feats.append(f.float().cpu().numpy())
+    if not feats:
+        return np.zeros((0, 0), dtype=np.float32)
+    return np.concatenate(feats, axis=0).astype(np.float32)
+
+
+def frechet_distance(feats_a, feats_b, eps=1e-5):
+    """Frechet distance between two (N, D) feature arrays (the FID core). None if <2 samples."""
+    if feats_a is None or feats_b is None:
+        return None
+    feats_a = np.asarray(feats_a, dtype=np.float64)
+    feats_b = np.asarray(feats_b, dtype=np.float64)
+    if feats_a.size == 0 or feats_b.size == 0:
+        return None
+    if feats_a.shape[0] < 2 or feats_b.shape[0] < 2:
+        return None
+    mu_a = feats_a.mean(axis=0)
+    mu_b = feats_b.mean(axis=0)
+    cov_a = np.cov(feats_a, rowvar=False)
+    cov_b = np.cov(feats_b, rowvar=False)
+    diff = mu_a - mu_b
+    mean_term = float(diff @ diff)
+    prod = cov_a @ cov_b
+    # trace(sqrtm(prod)): eigenvalues of the symmetrized product are real and >= 0.
+    evals = np.linalg.eigvalsh((prod + prod.T) / 2.0)
+    evals = np.clip(evals, 0.0, None)
+    sqrtm_trace = float(np.sqrt(evals).sum())
+    fid = mean_term + float(np.trace(cov_a)) + float(np.trace(cov_b)) - 2.0 * sqrtm_trace
+    return float(fid)
+
+
+def compute_fid(pred_paths, gt_paths, device=None):
+    """Set-level FID (lower is better) between two lists of image paths. None if <2 samples."""
+    if len(pred_paths) < 2 or len(gt_paths) < 2:
+        print("[warn] FID needs at least 2 matched images; skipping")
+        return None
+    pred_feats = inception_features(pred_paths, device=device)
+    gt_feats = inception_features(gt_paths, device=device)
+    return frechet_distance(pred_feats, gt_feats)
+
+
+def evaluate_dataset(pred_dir, gt_dir, output_file=None, resize_method='resize',
+                     lpips_net=None, compute_fid_flag=False):
     """评估整个数据集
     Evaluate the entire dataset
     """
     results = {}
     psnr_list = []
     ssim_list = []
+    lpips_list = []
+    matched_pred_paths = []
+    matched_gt_paths = []
     size_info = {}
     mode_info = {}
 
@@ -167,6 +291,12 @@ def evaluate_dataset(pred_dir, gt_dir, output_file=None, resize_method='resize')
             psnr_val, ssim_val, pred_size, gt_original_size, gt_mode = \
                 compute_metrics(pred_path, gt_path, resize_method)
 
+            # LPIPS (opt-in): reuse the same alignment as PSNR/SSIM
+            lpips_val = None
+            if lpips_net is not None:
+                lp_pred, lp_gt, _, _, _ = prepare_images_for_comparison(pred_path, gt_path, resize_method)
+                lpips_val = compute_lpips(lp_pred, lp_gt, net=lpips_net)
+
             # 保存结果
             # Save the result
             results[filename] = {
@@ -176,9 +306,15 @@ def evaluate_dataset(pred_dir, gt_dir, output_file=None, resize_method='resize')
                 'gt_original_size': gt_original_size,
                 'gt_mode': gt_mode
             }
+            if lpips_val is not None:
+                results[filename]['lpips'] = float(lpips_val)
+                lpips_list.append(lpips_val)
+
             psnr_list.append(psnr_val)
             ssim_list.append(ssim_val)
-            
+            matched_pred_paths.append(pred_path)
+            matched_gt_paths.append(gt_path)
+
             # 记录尺寸信息
             # Record size information
             size_key = f"{pred_size} <- {gt_original_size}"
@@ -203,7 +339,14 @@ def evaluate_dataset(pred_dir, gt_dir, output_file=None, resize_method='resize')
     avg_ssim = np.mean(ssim_list) if ssim_list else 0
     std_psnr = np.std(psnr_list) if psnr_list else 0
     std_ssim = np.std(ssim_list) if ssim_list else 0
-    
+    avg_lpips = float(np.mean(lpips_list)) if lpips_list else None
+    std_lpips = float(np.std(lpips_list)) if lpips_list else None
+
+    # FID (opt-in, set-level): compare all matched predictions against all GT images
+    fid_value = None
+    if compute_fid_flag:
+        fid_value = compute_fid(matched_pred_paths, matched_gt_paths)
+
     # 汇总结果
     # Summarize the results
     summary = {
@@ -221,6 +364,14 @@ def evaluate_dataset(pred_dir, gt_dir, output_file=None, resize_method='resize')
         'gt_modes': mode_info,
         'per_image_results': results
     }
+    if lpips_net is not None:
+        summary['lpips_net'] = lpips_net
+        summary['average_lpips'] = avg_lpips
+        summary['std_lpips'] = std_lpips
+        summary['min_lpips'] = float(np.min(lpips_list)) if lpips_list else None
+        summary['max_lpips'] = float(np.max(lpips_list)) if lpips_list else None
+    if compute_fid_flag:
+        summary['fid'] = fid_value
     
     # 打印结果
     # Print the results
@@ -238,6 +389,14 @@ def evaluate_dataset(pred_dir, gt_dir, output_file=None, resize_method='resize')
     print(f"Average SSIM: {summary['average_ssim']:.4f} +/- {summary['std_ssim']:.4f}")
     # original text:"SSIM 范围: [{summary['min_ssim']:.4f}, {summary['max_ssim']:.4f}]"
     print(f"SSIM range: [{summary['min_ssim']:.4f}, {summary['max_ssim']:.4f}]")
+    if lpips_net is not None and avg_lpips is not None:
+        print(f"Average LPIPS ({lpips_net}): {avg_lpips:.4f} +/- {std_lpips:.4f}  (lower is better)")
+        print(f"LPIPS range: [{summary['min_lpips']:.4f}, {summary['max_lpips']:.4f}]")
+    if compute_fid_flag:
+        if fid_value is not None:
+            print(f"FID: {fid_value:.2f}  (lower is better)")
+        else:
+            print("FID: n/a (need at least 2 matched images)")
     # original text:"\n图像信息:"
     print("\nImage information:")
     # original text:"  分辨率转换:"
@@ -267,7 +426,7 @@ def evaluate_dataset(pred_dir, gt_dir, output_file=None, resize_method='resize')
     
     return summary
 
-def compare_methods(pred_dir, gt_dir):
+def compare_methods(pred_dir, gt_dir, lpips_net=None, compute_fid_flag=False):
     """比较不同处理方法的结果
     Compare the results of the different processing methods
     """
@@ -279,7 +438,9 @@ def compare_methods(pred_dir, gt_dir):
         pred_dir, 
         gt_dir,
         'diffv2ir_evaluation_resize.json',
-        'resize'
+        'resize',
+        lpips_net=lpips_net,
+        compute_fid_flag=compute_fid_flag
     )
 
     # 使用crop方法
@@ -290,7 +451,9 @@ def compare_methods(pred_dir, gt_dir):
         pred_dir,
         gt_dir, 
         'diffv2ir_evaluation_crop.json',
-        'crop'
+        'crop',
+        lpips_net=lpips_net,
+        compute_fid_flag=compute_fid_flag
     )
 
     # 对比结果
@@ -327,10 +490,16 @@ if __name__ == "__main__":
     parser.add_argument('--method', type=str, default='resize',
                         choices=['resize', 'crop', 'both'],
                         help='Processing method: resize (adjust size), crop (center-crop), both (compare the two)')
-    
+    parser.add_argument('--lpips-net', type=str, default=None,
+                        choices=['alex', 'vgg', 'squeeze'],
+                        help='Enable LPIPS with the given backbone (lower is better). Off by default.')
+    parser.add_argument('--fid', action='store_true',
+                        help='Compute set-level FID (lower is better) over all matched pred/GT images.')
+
     args = parser.parse_args()
-    
+
     if args.method == 'both':
-        compare_methods(args.pred_dir, args.gt_dir)
+        compare_methods(args.pred_dir, args.gt_dir, lpips_net=args.lpips_net, compute_fid_flag=args.fid)
     else:
-        evaluate_dataset(args.pred_dir, args.gt_dir, args.output, args.method)
+        evaluate_dataset(args.pred_dir, args.gt_dir, args.output, args.method,
+                         lpips_net=args.lpips_net, compute_fid_flag=args.fid)
