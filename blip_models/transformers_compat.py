@@ -90,6 +90,20 @@ def _apply_chunking_to_forward(
     return tensor_output
 
 
+def init_model_weights(model):
+    """Version-robust weight initialization for the vendored PreTrainedModel subclasses.
+
+    On transformers >= 5.x, ``PreTrainedModel.init_weights()`` goes through a new
+    tied-weights code path that requires state (``all_tied_weights_keys``) these
+    vendored models never set up (they have no tied weights). Fall back to the
+    classic module-wise initialization, which is what older versions did.
+    """
+    try:
+        model.init_weights()
+    except AttributeError:
+        model.apply(model._init_weights)
+
+
 try:
     from transformers.modeling_utils import apply_chunking_to_forward
 except ImportError:

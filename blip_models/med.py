@@ -40,6 +40,7 @@ from transformers.modeling_utils import PreTrainedModel
 from blip_models.transformers_compat import (
     apply_chunking_to_forward,
     find_pruneable_heads_and_indices,
+    init_model_weights,
     prune_linear_layer,
 )
 from transformers.utils import logging
@@ -588,7 +589,7 @@ class BertModel(BertPreTrainedModel):
 
         self.pooler = BertPooler(config) if add_pooling_layer else None
 
-        self.init_weights()
+        init_model_weights(self)
  
 
     def get_input_embeddings(self):
@@ -819,7 +820,7 @@ class BertLMHeadModel(BertPreTrainedModel):
         self.bert = BertModel(config, add_pooling_layer=False)
         self.cls = BertOnlyMLMHead(config)
 
-        self.init_weights()
+        init_model_weights(self)
 
     def get_output_embeddings(self):
         return self.cls.predictions.decoder
