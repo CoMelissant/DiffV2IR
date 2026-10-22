@@ -125,13 +125,12 @@ def _local_invert_attention_mask(encoder_attention_mask):
 def invert_attention_mask(model, encoder_attention_mask):
     """Invert an attention mask (keep=1 -> 0, drop=0 -> float min).
 
-    Provided by PreTrainedModel in transformers < 5.x; removed on >= 5.x.
+    Historically provided by PreTrainedModel; deprecated in transformers >= 5.x
+    (moved to transformers.masking_utils) and slated for removal. The local
+    implementation is semantically identical on all versions, so it is used
+    unconditionally to stay warning-free and future-proof.
     """
-    try:
-        from transformers.modeling_utils import PreTrainedModel
-        return PreTrainedModel.invert_attention_mask(model, encoder_attention_mask)
-    except AttributeError:
-        return _local_invert_attention_mask(encoder_attention_mask)
+    return _local_invert_attention_mask(encoder_attention_mask)
 
 
 def init_model_weights(model):
