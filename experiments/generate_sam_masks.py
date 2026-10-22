@@ -92,7 +92,11 @@ def process_directory(input_dir, output_dir, model_type="vit_h", checkpoint_path
         print(f"\nProcessing {i+1}/{len(image_files)}: {image_file}")
         
         input_path = os.path.join(input_dir, image_file)
-        output_file = os.path.splitext(image_file)[0] + '_mask.png'
+        if input_dir==output_dir:
+            output_file = os.path.splitext(image_file)[0] + '_mask.png'
+        else:
+            output_file = os.path.splitext(image_file)[0] + '.png'
+            
         output_path = os.path.join(output_dir, output_file)
         
         try:
