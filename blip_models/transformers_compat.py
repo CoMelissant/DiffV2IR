@@ -90,6 +90,50 @@ def _apply_chunking_to_forward(
     return tensor_output
 
 
+def _local_get_head_mask(mask, num_hidden_layers):
+    if mask is None:
+        return [None] * num_hidden_layers
+    if len(mask.shape) == 1:
+        mask = mask[None, :].expand(num_hidden_layers, -1)
+    elif len(mask.shape) != 2:
+        raise ValueError(
+            f"Head mask should have shape (num_heads,) or "
+            f"(num_hidden_layers, num_heads), got {mask.shape}"
+        )
+    return [mask[i] for i in range(num_hidden_layers)]
+
+
+def get_head_mask(model, mask, num_hidden_layers):
+    """Per-layer head mask expansion.
+
+    In transformers < 5.x this comes from ModelUtilsMixin (mixed into
+    PreTrainedModel); on >= 5.x it was removed, so use a local equivalent.
+    """
+    try:
+        from transformers.modeling_utils import ModelUtilsMixin
+        return ModelUtilsMixin.get_head_mask(model, mask, num_hidden_layers)
+    except (ImportError, AttributeError):
+        return _local_get_head_mask(mask, num_hidden_layers)
+
+
+def _local_invert_attention_mask(encoder_attention_mask):
+    if len(encoder_attention_mask.shape) == 3:
+        return (1.0 - encoder_attention_mask.to(dtype=torch.float32)) * torch.finfo(torch.float32).min
+    return encoder_attention_mask
+
+
+def invert_attention_mask(model, encoder_attention_mask):
+    """Invert an attention mask (keep=1 -> 0, drop=0 -> float min).
+
+    Provided by PreTrainedModel in transformers < 5.x; removed on >= 5.x.
+    """
+    try:
+        from transformers.modeling_utils import PreTrainedModel
+        return PreTrainedModel.invert_attention_mask(model, encoder_attention_mask)
+    except AttributeError:
+        return _local_invert_attention_mask(encoder_attention_mask)
+
+
 def init_model_weights(model):
     """Version-robust weight initialization for the vendored PreTrainedModel subclasses.
 

@@ -30,7 +30,9 @@ from transformers.modeling_utils import PreTrainedModel
 from blip_models.transformers_compat import (
     apply_chunking_to_forward,
     find_pruneable_heads_and_indices,
+    get_head_mask,
     init_model_weights,
+    invert_attention_mask,
     prune_linear_layer,
 )
 from transformers.utils import logging
@@ -788,12 +790,12 @@ class BertModel(BertPreTrainedModel):
             encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
             
             if type(encoder_attention_mask) == list:
-                encoder_extended_attention_mask = [self.invert_attention_mask(mask) for mask in encoder_attention_mask]
+                encoder_extended_attention_mask = [invert_attention_mask(self, mask) for mask in encoder_attention_mask]
             elif encoder_attention_mask is None:
                 encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
-                encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+                encoder_extended_attention_mask = invert_attention_mask(self, encoder_attention_mask)
             else:    
-                encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+                encoder_extended_attention_mask = invert_attention_mask(self, encoder_attention_mask)
         else:
             encoder_extended_attention_mask = None
 
@@ -802,7 +804,7 @@ class BertModel(BertPreTrainedModel):
         # attention_probs has shape bsz x n_heads x N x N
         # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
         # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
-        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+        head_mask = get_head_mask(self, head_mask, self.config.num_hidden_layers)
         
         if encoder_embeds is None:
             embedding_output = self.embeddings(
