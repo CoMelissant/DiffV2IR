@@ -10,6 +10,7 @@ warnings.filterwarnings("ignore")
 
 from blip_models.vit import VisionTransformer, interpolate_pos_embed
 from blip_models.med import BertConfig, BertModel, BertLMHeadModel
+from blip_models.transformers_compat import local_generate
 from transformers import BertTokenizer
 
 import torch
@@ -139,28 +140,18 @@ class BLIP_Decoder(nn.Module):
         input_ids[:,0] = self.tokenizer.bos_token_id
         input_ids = input_ids[:, :-1] 
 
-        if sample:
-            #nucleus sampling
-            outputs = self.text_decoder.generate(input_ids=input_ids,
-                                                  max_length=max_length,
-                                                  min_length=min_length,
-                                                  do_sample=True,
-                                                  top_p=top_p,
-                                                  num_return_sequences=1,
-                                                  eos_token_id=self.tokenizer.sep_token_id,
-                                                  pad_token_id=self.tokenizer.pad_token_id, 
-                                                  repetition_penalty=1.1,                                            
-                                                  **model_kwargs)
-        else:
-            #beam search
-            outputs = self.text_decoder.generate(input_ids=input_ids,
-                                                  max_length=max_length,
-                                                  min_length=min_length,
-                                                  num_beams=num_beams,
-                                                  eos_token_id=self.tokenizer.sep_token_id,
-                                                  pad_token_id=self.tokenizer.pad_token_id,     
-                                                  repetition_penalty=repetition_penalty,
-                                                  **model_kwargs)            
+        outputs = local_generate(self.text_decoder,
+                                 input_ids=input_ids,
+                                 encoder_hidden_states=model_kwargs["encoder_hidden_states"],
+                                 encoder_attention_mask=model_kwargs["encoder_attention_mask"],
+                                 sample=sample,
+                                 num_beams=num_beams,
+                                 max_length=max_length,
+                                 min_length=min_length,
+                                 top_p=top_p,
+                                 repetition_penalty=1.1 if sample else repetition_penalty,
+                                 eos_token_id=self.tokenizer.sep_token_id,
+                                 pad_token_id=self.tokenizer.pad_token_id)
             
         captions = []    
         for output in outputs:

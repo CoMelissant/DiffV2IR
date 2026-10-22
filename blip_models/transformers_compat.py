@@ -127,3 +127,159 @@ except ImportError:
         from transformers.pytorch_utils import prune_linear_layer
     except ImportError:
         prune_linear_layer = _prune_linear_layer
+
+
+# ---------------------------------------------------------------------------
+# Local text generation.
+#
+# On transformers >= 5.x, ``generate()`` is no longer mixed into
+# PreTrainedModel, so the vendored BertLMHeadModel lost it. Instead of
+# depending on whichever generation API a given transformers version ships,
+# this implements the two strategies BLIP uses (nucleus sampling and beam
+# search) in pure PyTorch with HuggingFace-equivalent semantics. Used as a
+# single code path on all versions for reproducibility.
+# ---------------------------------------------------------------------------
+
+
+def _apply_repetition_penalty(logits, input_ids, penalty):
+    if penalty == 1.0:
+        return logits
+    score = torch.gather(logits, 1, input_ids)
+    score = torch.where(score > 0, score / penalty, score * penalty)
+    return logits.scatter_(1, input_ids, score)
+
+
+def _top_p_filter(logits, top_p):
+    if top_p >= 1.0:
+        return logits
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+    # Remove tokens until the cumulative probability exceeds top_p, keeping
+    # at least one token (shift so the first exceeding token is removed too).
+    sorted_indices_to_remove = cumulative_probs > top_p
+    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+    sorted_indices_to_remove[..., 0] = False
+    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+    return logits.masked_fill(indices_to_remove, float("-inf"))
+
+
+def _nucleus_sample(model, input_ids, encoder_hidden_states, encoder_attention_mask,
+                    max_length, min_length, top_p, repetition_penalty,
+                    eos_token_id, pad_token_id):
+    batch_size = input_ids.size(0)
+    device = input_ids.device
+    generated = input_ids
+    attention_mask = torch.ones_like(generated)
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    for _ in range(max_length - input_ids.size(1)):
+        outputs = model(
+            input_ids=generated,
+            attention_mask=attention_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+        )
+        next_logits = outputs.logits[:, -1, :]
+        next_logits = _apply_repetition_penalty(next_logits, generated, repetition_penalty)
+        if generated.size(1) < min_length:
+            next_logits[:, eos_token_id] = float("-inf")
+        next_logits = _top_p_filter(next_logits, top_p)
+        probs = torch.softmax(next_logits, dim=-1)
+        next_tokens = torch.multinomial(probs, num_samples=1)
+        next_tokens = torch.where(
+            finished.unsqueeze(1), torch.full_like(next_tokens, pad_token_id), next_tokens
+        )
+        generated = torch.cat([generated, next_tokens], dim=1)
+        attention_mask = torch.cat([attention_mask, torch.ones_like(next_tokens)], dim=1)
+        finished |= next_tokens.squeeze(1).eq(eos_token_id)
+        if finished.all():
+            break
+    return generated
+
+
+def _beam_search(model, input_ids, encoder_hidden_states, encoder_attention_mask,
+                 num_beams, max_length, min_length, repetition_penalty,
+                 eos_token_id, pad_token_id):
+    # Note: like HF's generate(), encoder_hidden_states / encoder_attention_mask
+    # must already be expanded to batch_size * num_beams by the caller
+    # (blip.py does this with repeat_interleave before calling local_generate).
+    batch_size = input_ids.size(0)
+    device = input_ids.device
+
+    beams = input_ids.repeat_interleave(num_beams, dim=0)
+    enc_hidden = encoder_hidden_states
+    enc_mask = encoder_attention_mask
+    attention_mask = torch.ones_like(beams)
+    beam_scores = torch.zeros(batch_size * num_beams, dtype=torch.float32, device=device)
+    done = torch.zeros(batch_size * num_beams, dtype=torch.bool, device=device)
+
+    for _ in range(max_length - input_ids.size(1)):
+        outputs = model(
+            input_ids=beams,
+            attention_mask=attention_mask,
+            encoder_hidden_states=enc_hidden,
+            encoder_attention_mask=enc_mask,
+        )
+        next_logits = outputs.logits[:, -1, :]
+        next_logits = _apply_repetition_penalty(next_logits, beams, repetition_penalty)
+        if beams.size(1) < min_length:
+            next_logits[:, eos_token_id] = float("-inf")
+        next_scores = torch.log_softmax(next_logits, dim=-1)
+        next_scores = next_scores + beam_scores.unsqueeze(1)
+        # Finished beams keep their score (no extension) and continue with pad tokens.
+        if done.any():
+            next_scores[done] = beam_scores[done].unsqueeze(1)
+
+        vocab_size = next_scores.size(-1)
+        next_scores = next_scores.view(batch_size, num_beams * vocab_size)
+        topk_scores, topk_indices = torch.topk(next_scores, num_beams, dim=-1)
+        parent_beams = (topk_indices // vocab_size)
+        next_tokens = topk_indices % vocab_size
+
+        batch_offsets = torch.arange(batch_size, device=device).unsqueeze(1) * num_beams
+        parent_rows = (batch_offsets + parent_beams).reshape(-1)
+
+        new_done = done[parent_rows] | next_tokens.reshape(-1).eq(eos_token_id)
+        next_tokens = torch.where(
+            new_done.unsqueeze(1),
+            torch.full_like(next_tokens, pad_token_id).reshape(-1, 1),
+            next_tokens.reshape(-1, 1),
+        )
+        beams = torch.cat([beams[parent_rows], next_tokens], dim=1)
+        attention_mask = torch.cat(
+            [attention_mask[parent_rows], torch.ones(batch_size * num_beams, 1, dtype=torch.long, device=device)],
+            dim=1,
+        )
+        beam_scores = topk_scores.reshape(-1)
+        done = new_done
+
+        if done.view(batch_size, num_beams).all(dim=1).all():
+            break
+
+    # Return the highest-scoring beam per batch element.
+    final_scores = beam_scores.view(batch_size, num_beams)
+    best = final_scores.argmax(dim=1)
+    return beams[best * num_beams + best]
+
+
+def local_generate(model, input_ids, encoder_hidden_states, encoder_attention_mask,
+                   sample=False, num_beams=3, max_length=30, min_length=10,
+                   top_p=0.9, repetition_penalty=1.0, eos_token_id=None, pad_token_id=None):
+    """HuggingFace-style generation for the vendored BLIP text decoder.
+
+    Returns a LongTensor of shape (batch_size, generated_length) containing
+    the prompt plus the generated tokens, like ``PreTrainedModel.generate``.
+    """
+    if sample:
+        return _nucleus_sample(
+            model, input_ids, encoder_hidden_states, encoder_attention_mask,
+            max_length=max_length, min_length=min_length, top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            eos_token_id=eos_token_id, pad_token_id=pad_token_id,
+        )
+    return _beam_search(
+        model, input_ids, encoder_hidden_states, encoder_attention_mask,
+        num_beams=num_beams, max_length=max_length, min_length=min_length,
+        repetition_penalty=repetition_penalty,
+        eos_token_id=eos_token_id, pad_token_id=pad_token_id,
+    )
