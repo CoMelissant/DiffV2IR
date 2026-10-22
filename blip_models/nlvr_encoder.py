@@ -26,15 +26,12 @@ from transformers.modeling_outputs import (
     SequenceClassifierOutput,
     TokenClassifierOutput,
 )
-from transformers.modeling_utils import (
-    PreTrainedModel,
+from transformers.modeling_utils import PreTrainedModel
+from blip_models.transformers_compat import (
+    apply_chunking_to_forward,
     find_pruneable_heads_and_indices,
     prune_linear_layer,
 )
-try:
-    from transformers.modeling_utils import apply_chunking_to_forward
-except ImportError:
-    from transformers.pytorch_utils import apply_chunking_to_forward
 from transformers.utils import logging
 from transformers.models.bert.configuration_bert import BertConfig
 
